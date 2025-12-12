@@ -7,7 +7,7 @@ from sklearn.ensemble import AdaBoostRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import r2_score, mean_absolute_error
 
-CSV_PATH = "오렌지3 업로드 파일 최신 csv_승인완료 -11 18수정_승인완료.csv"
+CSV_PATH = "전처리완료 data (수율파악)_승인완료.csv"
 
 @st.cache_resource
 def load_model():

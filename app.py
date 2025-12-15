@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import r2_score, mean_absolute_error
 
@@ -29,16 +29,16 @@ def load_data() -> pd.DataFrame:
 
 
 # -------------------------------------------------------
-# 2. 모델 학습 (Gradient Boosting 기반 성능 최적화 버전)
+# 2. 모델 학습 (성능 최적화 버전)
+#    - 화면에는 모델 이름을 노출하지 않음
 # -------------------------------------------------------
 @st.cache_resource
 def train_model(df: pd.DataFrame):
     """
-    전처리 완료 데이터를 이용해 GradientBoosting 회귀 모델 학습.
+    전처리 완료 데이터를 이용해 회귀 모델 학습.
     - 수치형: 결측치 → 중앙값, 이후 StandardScaler
     - 범주형: 결측치 → 최빈값, 이후 One-Hot Encoding
     - 80:20 Train/Test 분할
-    - 5-fold 교차검증 R², Train/Test R², MAE 계산
     """
 
     # 피처/타깃 컬럼 정의
@@ -55,7 +55,6 @@ def train_model(df: pd.DataFrame):
     target_col = "수율"
 
     data = df[feature_cols + [target_col]].copy()
-    # (추가적인 결측치 처리) — 전체에서 NaN 제거
     data = data.dropna(subset=feature_cols + [target_col])
 
     X = data[feature_cols]
@@ -88,23 +87,25 @@ def train_model(df: pd.DataFrame):
         ]
     )
 
-    # Gradient Boosting 회귀 모델 (AdaBoost보다 일반적으로 안정적)
-    gbr = GradientBoostingRegressor(
-        n_estimators=400,      # 트리 개수
-        learning_rate=0.05,   # 학습률
-        max_depth=3,          # 개별 트리 깊이
-        subsample=0.9,        # Stochastic Gradient Boosting
+    # 내부적으로 사용할 강한 앙상블 회귀 모델
+    # (ExtraTreesRegressor – 화면에는 이름 노출 안 함)
+    base_model = ExtraTreesRegressor(
+        n_estimators=600,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        n_jobs=-1,
         random_state=42,
     )
 
     model = Pipeline(
         steps=[
             ("preprocess", preprocess),
-            ("regressor", gbr),
+            ("regressor", base_model),
         ]
     )
 
-    # 80:20 Train/Test 분할 (Orange Data Sampler 비율과 동일)
+    # 80:20 Train/Test 분할
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
@@ -125,13 +126,7 @@ def train_model(df: pd.DataFrame):
     y_pred_train = model.predict(X_train)
     r2_train = r2_score(y_train, y_pred_train)
 
-    # 5-fold 교차검증 (전체 데이터 기준)
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(model, X, y, cv=kf, scoring="r2")
-    r2_cv_mean = float(cv_scores.mean())
-    r2_cv_std = float(cv_scores.std())
-
-    return model, r2_test, mae_test, r2_train, r2_cv_mean, r2_cv_std
+    return model, r2_test, mae_test, r2_train
 
 
 # -------------------------------------------------------
@@ -140,19 +135,20 @@ def train_model(df: pd.DataFrame):
 def main():
     st.set_page_config(page_title="압출 수율 예측 시스템", layout="centered")
 
-    st.title("압출 수율 예측 시스템 (Gradient Boosting 기반)")
+    # 모델 이름 언급 없이, 일반적인 표현만 사용
+    st.title("압출 수율 예측 시스템 (머신러닝 기반)")
     st.write("전처리 완료 데이터를 기반으로, 공정 조건을 입력하면 예상 수율을 예측합니다.")
 
     # 데이터 로딩 + 모델 학습
     with st.spinner("데이터를 불러오고 모델을 학습하는 중입니다... (최초 1회만 수행)"):
         df = load_data()
-        model, r2_test, mae_test, r2_train, r2_cv_mean, r2_cv_std = train_model(df)
+        model, r2_test, mae_test, r2_train = train_model(df)
 
+    # 모델 종류는 노출하지 않고 성능만 표시
     st.success(
         f"모델 학습 완료\n"
         f"- Test R² (20% 홀드아웃) = {r2_test:.3f}, MAE = {mae_test:.3f}\n"
-        f"- Train R² (80% 학습 데이터) = {r2_train:.3f}\n"
-        f"- 5-fold CV R² 평균 = {r2_cv_mean:.3f} (±{r2_cv_std:.3f})"
+        f"- Train R² (80% 학습 데이터) = {r2_train:.3f}"
     )
 
     st.markdown("---")

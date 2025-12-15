@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.ensemble import GradientBoostingRegressor, ExtraTreesRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import r2_score, mean_absolute_error
 
@@ -21,30 +21,30 @@ CSV_PATH = "전처리완료 data (수율파악)_승인완료.csv"
 def load_data() -> pd.DataFrame:
     """전처리 완료 CSV 로드."""
     df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
-
-    # 타깃 결측치는 제거
     df = df.dropna(subset=["수율"])
-
     return df
 
 
 # -------------------------------------------------------
-# 2. 모델 학습 (성능 최적화 버전)
-#    - 화면에는 모델 이름을 노출하지 않음
+# 2. 모델 학습
+#    - 생산중량은 사용하지 않고, 나머지 인자만 사용
+#    - 여러 모델 중 교차검증 R²가 가장 좋은 모델 자동 선택
+#    - 모델 이름은 UI에 노출하지 않음
 # -------------------------------------------------------
 @st.cache_resource
 def train_model(df: pd.DataFrame):
     """
     전처리 완료 데이터를 이용해 회귀 모델 학습.
+    - 사용 피처: 형태, 제품길이, 제품두께, 품종, 완제형태, Billet 규격, Hole수
     - 수치형: 결측치 → 중앙값, 이후 StandardScaler
     - 범주형: 결측치 → 최빈값, 이후 One-Hot Encoding
     - 80:20 Train/Test 분할
+    - Train 데이터에서 5-fold 교차검증으로 최적 모델 선택
     """
 
-    # 피처/타깃 컬럼 정의
+    # 피처/타깃 컬럼 정의 (생산중량 제외)
     feature_cols = [
         "형태",
-        "생산중량",
         "제품길이",
         "제품두께",
         "품종",
@@ -62,7 +62,7 @@ def train_model(df: pd.DataFrame):
 
     # 범주형 / 수치형 구분
     cat_cols = ["형태", "품종", "완제형태", "Billet 규격"]
-    num_cols = ["생산중량", "제품길이", "제품두께", "Hole수"]
+    num_cols = ["제품길이", "제품두께", "Hole수"]
 
     # 수치형 전처리: 중앙값 대체 + 표준화
     num_transformer = Pipeline(
@@ -87,24 +87,6 @@ def train_model(df: pd.DataFrame):
         ]
     )
 
-    # 내부적으로 사용할 강한 앙상블 회귀 모델
-    # (ExtraTreesRegressor – 화면에는 이름 노출 안 함)
-    base_model = ExtraTreesRegressor(
-        n_estimators=600,
-        max_depth=None,
-        min_samples_split=2,
-        min_samples_leaf=1,
-        n_jobs=-1,
-        random_state=42,
-    )
-
-    model = Pipeline(
-        steps=[
-            ("preprocess", preprocess),
-            ("regressor", base_model),
-        ]
-    )
-
     # 80:20 Train/Test 분할
     X_train, X_test, y_train, y_test = train_test_split(
         X,
@@ -114,19 +96,66 @@ def train_model(df: pd.DataFrame):
         random_state=42,
     )
 
-    # 학습
-    model.fit(X_train, y_train)
+    # 후보 모델들 정의 (UI에는 이름 노출 안 함)
+    candidate_models = {
+        "gbr": GradientBoostingRegressor(
+            n_estimators=500,
+            learning_rate=0.03,
+            max_depth=4,
+            subsample=0.9,
+            random_state=42,
+        ),
+        "extratrees": ExtraTreesRegressor(
+            n_estimators=600,
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            n_jobs=-1,
+            random_state=42,
+        ),
+    }
 
-    # Test 성능
-    y_pred_test = model.predict(X_test)
+    best_name = None
+    best_score = -np.inf
+    best_estimator = None
+
+    # Train 데이터에서 5-fold CV로 가장 좋은 모델 선택
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    for name, reg in candidate_models.items():
+        pipe = Pipeline(
+            steps=[
+                ("preprocess", preprocess),
+                ("regressor", reg),
+            ]
+        )
+        scores = cross_val_score(pipe, X_train, y_train, cv=cv, scoring="r2")
+        mean_score = scores.mean()
+
+        if mean_score > best_score:
+            best_score = mean_score
+            best_name = name
+            best_estimator = reg
+
+    # 선택된 최적 모델로 최종 파이프라인 구성 후 학습
+    best_model = Pipeline(
+        steps=[
+            ("preprocess", preprocess),
+            ("regressor", best_estimator),
+        ]
+    )
+    best_model.fit(X_train, y_train)
+
+    # 성능 측정
+    y_pred_test = best_model.predict(X_test)
+    y_pred_train = best_model.predict(X_train)
+
     r2_test = r2_score(y_test, y_pred_test)
     mae_test = mean_absolute_error(y_test, y_pred_test)
-
-    # Train 성능
-    y_pred_train = model.predict(X_train)
     r2_train = r2_score(y_train, y_pred_train)
 
-    return model, r2_test, mae_test, r2_train
+    # best_name은 내부 확인용으로만 사용 가능 (UI에는 안 씀)
+    return best_model, r2_test, mae_test, r2_train
 
 
 # -------------------------------------------------------
@@ -135,16 +164,15 @@ def train_model(df: pd.DataFrame):
 def main():
     st.set_page_config(page_title="압출 수율 예측 시스템", layout="centered")
 
-    # 모델 이름 언급 없이, 일반적인 표현만 사용
     st.title("압출 수율 예측 시스템 (머신러닝 기반)")
-    st.write("전처리 완료 데이터를 기반으로, 공정 조건을 입력하면 예상 수율을 예측합니다.")
+    st.write("생산중량을 제외한 공정 인자를 기반으로 예상 수율을 예측합니다.")
 
     # 데이터 로딩 + 모델 학습
     with st.spinner("데이터를 불러오고 모델을 학습하는 중입니다... (최초 1회만 수행)"):
         df = load_data()
         model, r2_test, mae_test, r2_train = train_model(df)
 
-    # 모델 종류는 노출하지 않고 성능만 표시
+    # 모델명 노출 없이 성능만 표시
     st.success(
         f"모델 학습 완료\n"
         f"- Test R² (20% 홀드아웃) = {r2_test:.3f}, MAE = {mae_test:.3f}\n"
@@ -160,7 +188,6 @@ def main():
     완제형태_options = sorted(df["완제형태"].dropna().unique().tolist())
     billet_options = sorted(df["Billet 규격"].dropna().unique().tolist())
 
-    생산중량_default = float(df["생산중량"].median())
     제품길이_default = float(df["제품길이"].median())
     제품두께_default = float(df["제품두께"].median())
     hole_default = int(df["Hole수"].median())
@@ -175,9 +202,6 @@ def main():
             Billet규격 = st.selectbox("Billet 규격", billet_options)
 
         with col2:
-            생산중량 = st.number_input(
-                "생산중량 (kg)", min_value=0.0, value=생산중량_default, step=10.0
-            )
             제품길이 = st.number_input(
                 "제품길이 (mm)", min_value=0.0, value=제품길이_default, step=100.0
             )
@@ -191,11 +215,10 @@ def main():
         submitted = st.form_submit_button("수율 예측하기")
 
     if submitted:
-        # 입력값을 DataFrame으로 구성
+        # 입력값을 DataFrame으로 구성 (생산중량은 아예 사용하지 않음)
         input_df = pd.DataFrame(
             [{
                 "형태": 형태,
-                "생산중량": 생산중량,
                 "제품길이": 제품길이,
                 "제품두께": 제품두께,
                 "품종": 품종,
@@ -211,16 +234,6 @@ def main():
 
         st.subheader("예측 결과")
         st.write(f"예상 수율: **{yield_percent:.2f}%**")
-
-        # 참고용: 유사 조건 실제 데이터 표시
-        st.markdown("#### 참고: 유사 조건 실제 데이터 (상위 10개)")
-        mask = (df["형태"] == 형태) & (df["품종"] == 품종)
-        similar = df[mask].copy()
-        if similar.empty:
-            st.write("같은 형태/품종 데이터가 없습니다. 전체 데이터 중 상위 10개를 표시합니다.")
-            st.dataframe(df.head(10))
-        else:
-            st.dataframe(similar.head(10))
 
 
 if __name__ == "__main__":

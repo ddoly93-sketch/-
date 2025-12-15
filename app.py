@@ -6,11 +6,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import r2_score, mean_absolute_error
 
-# CSV 파일명 (DRM 때문에 파일명 그대로 사용)
+# CSV 파일명 (그대로 사용)
 CSV_PATH = "전처리완료 data (수율파악)_승인완료.csv"
 
 
@@ -19,18 +19,29 @@ CSV_PATH = "전처리완료 data (수율파악)_승인완료.csv"
 # -------------------------------------------------------
 @st.cache_data
 def load_data() -> pd.DataFrame:
+    """전처리 완료 CSV 로드."""
     df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
+
     # 타깃 결측치는 제거
     df = df.dropna(subset=["수율"])
+
     return df
 
 
 # -------------------------------------------------------
-# 2. Gradient Boosting 모델 학습
-#    (모델 이름은 화면에 노출하지 않음)
+# 2. 모델 학습 (성능 최적화 버전)
+#    - 화면에는 모델 이름을 노출하지 않음
 # -------------------------------------------------------
 @st.cache_resource
 def train_model(df: pd.DataFrame):
+    """
+    전처리 완료 데이터를 이용해 회귀 모델 학습.
+    - 수치형: 결측치 → 중앙값, 이후 StandardScaler
+    - 범주형: 결측치 → 최빈값, 이후 One-Hot Encoding
+    - 80:20 Train/Test 분할
+    """
+
+    # 피처/타깃 컬럼 정의
     feature_cols = [
         "형태",
         "생산중량",
@@ -43,7 +54,8 @@ def train_model(df: pd.DataFrame):
     ]
     target_col = "수율"
 
-    data = df[feature_cols + [target_col]].dropna()
+    data = df[feature_cols + [target_col]].copy()
+    data = data.dropna(subset=feature_cols + [target_col])
 
     X = data[feature_cols]
     y = data[target_col]
@@ -52,13 +64,15 @@ def train_model(df: pd.DataFrame):
     cat_cols = ["형태", "품종", "완제형태", "Billet 규격"]
     num_cols = ["생산중량", "제품길이", "제품두께", "Hole수"]
 
-    # 전처리 정의
+    # 수치형 전처리: 중앙값 대체 + 표준화
     num_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
         ]
     )
+
+    # 범주형 전처리: 최빈값 대체 + 원-핫 인코딩
     cat_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
@@ -68,41 +82,48 @@ def train_model(df: pd.DataFrame):
 
     preprocess = ColumnTransformer(
         transformers=[
-            ("num", num_transformer, num_cols),
             ("cat", cat_transformer, cat_cols),
+            ("num", num_transformer, num_cols),
         ]
     )
 
-    # 내부적으로 사용할 Gradient Boosting 모델
-    model_core = GradientBoostingRegressor(
+    # 내부적으로 사용할 강한 앙상블 회귀 모델
+    # (ExtraTreesRegressor – 화면에는 이름 노출 안 함)
+    base_model = ExtraTreesRegressor(
         n_estimators=600,
-        learning_rate=0.03,
-        max_depth=4,
-        subsample=0.9,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        n_jobs=-1,
         random_state=42,
     )
 
     model = Pipeline(
         steps=[
             ("preprocess", preprocess),
-            ("regressor", model_core),
+            ("regressor", base_model),
         ]
     )
 
-    # 80:20 train/test split
+    # 80:20 Train/Test 분할
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=True, random_state=42
+        X,
+        y,
+        test_size=0.2,
+        shuffle=True,
+        random_state=42,
     )
 
     # 학습
     model.fit(X_train, y_train)
 
-    # 성능 측정
+    # Test 성능
     y_pred_test = model.predict(X_test)
-    y_pred_train = model.predict(X_train)
-
     r2_test = r2_score(y_test, y_pred_test)
     mae_test = mean_absolute_error(y_test, y_pred_test)
+
+    # Train 성능
+    y_pred_train = model.predict(X_train)
     r2_train = r2_score(y_train, y_pred_train)
 
     return model, r2_test, mae_test, r2_train
@@ -113,25 +134,27 @@ def train_model(df: pd.DataFrame):
 # -------------------------------------------------------
 def main():
     st.set_page_config(page_title="압출 수율 예측 시스템", layout="centered")
-    st.title("압출 수율 예측 시스템 (머신러닝 기반)")
-    st.write("전처리 완료 데이터를 기반으로, 입력 조건에 따라 예상 수율을 예측합니다.")
 
-    # 모델 준비
-    with st.spinner("모델 학습 중... (최초 1회)"):
+    # 모델 이름 언급 없이, 일반적인 표현만 사용
+    st.title("압출 수율 예측 시스템 (머신러닝 기반)")
+    st.write("전처리 완료 데이터를 기반으로, 공정 조건을 입력하면 예상 수율을 예측합니다.")
+
+    # 데이터 로딩 + 모델 학습
+    with st.spinner("데이터를 불러오고 모델을 학습하는 중입니다... (최초 1회만 수행)"):
         df = load_data()
         model, r2_test, mae_test, r2_train = train_model(df)
 
-    # 성능 표시 (모델명 숨김)
+    # 모델 종류는 노출하지 않고 성능만 표시
     st.success(
         f"모델 학습 완료\n"
-        f"- Test R² = {r2_test:.3f}, MAE = {mae_test:.3f}\n"
-        f"- Train R² = {r2_train:.3f}"
+        f"- Test R² (20% 홀드아웃) = {r2_test:.3f}, MAE = {mae_test:.3f}\n"
+        f"- Train R² (80% 학습 데이터) = {r2_train:.3f}"
     )
 
     st.markdown("---")
     st.subheader("입력 조건")
 
-    # 옵션 값 자동 추출
+    # 입력 옵션 생성 (실제 데이터 기반)
     형태_options = sorted(df["형태"].dropna().unique().tolist())
     품종_options = sorted(df["품종"].dropna().unique().tolist())
     완제형태_options = sorted(df["완제형태"].dropna().unique().tolist())
@@ -153,34 +176,23 @@ def main():
 
         with col2:
             생산중량 = st.number_input(
-                "생산중량 (kg)",
-                min_value=0.0,
-                value=생산중량_default,
-                step=10.0,
+                "생산중량 (kg)", min_value=0.0, value=생산중량_default, step=10.0
             )
             제품길이 = st.number_input(
-                "제품길이 (mm)",
-                min_value=0.0,
-                value=제품길이_default,
-                step=100.0,
+                "제품길이 (mm)", min_value=0.0, value=제품길이_default, step=100.0
             )
             제품두께 = st.number_input(
-                "제품두께 (mm)",
-                min_value=0.0,
-                value=제품두께_default,
-                step=0.01,
+                "제품두께 (mm)", min_value=0.0, value=제품두께_default, step=0.01
             )
             Hole수 = st.number_input(
-                "Hole 수",
-                min_value=1,
-                value=hole_default,
-                step=1,
+                "Hole 수", min_value=1, value=hole_default, step=1
             )
 
-        submit = st.form_submit_button("수율 예측하기")
+        submitted = st.form_submit_button("수율 예측하기")
 
-    if submit:
-        input_data = pd.DataFrame(
+    if submitted:
+        # 입력값을 DataFrame으로 구성
+        input_df = pd.DataFrame(
             [{
                 "형태": 형태,
                 "생산중량": 생산중량,
@@ -193,11 +205,22 @@ def main():
             }]
         )
 
-        # 예측 (수율을 0~1로 학습했다고 가정하고 %로 변환)
-        pred = model.predict(input_data)[0] * 100.0
+        # 예측
+        pred = model.predict(input_df)[0]
+        yield_percent = float(pred) * 100.0
 
         st.subheader("예측 결과")
-        st.write(f"예상 수율: **{pred:.2f}%**")
+        st.write(f"예상 수율: **{yield_percent:.2f}%**")
+
+        # 참고용: 유사 조건 실제 데이터 표시
+        st.markdown("#### 참고: 유사 조건 실제 데이터 (상위 10개)")
+        mask = (df["형태"] == 형태) & (df["품종"] == 품종)
+        similar = df[mask].copy()
+        if similar.empty:
+            st.write("같은 형태/품종 데이터가 없습니다. 전체 데이터 중 상위 10개를 표시합니다.")
+            st.dataframe(df.head(10))
+        else:
+            st.dataframe(similar.head(10))
 
 
 if __name__ == "__main__":
